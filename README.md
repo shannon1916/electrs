@@ -69,6 +69,46 @@ In addition to electrs's original configuration options, a few new options are a
 
 See `$ cargo run --release --bin electrs -- --help` for the full list of options.
 
+### Trouble-shooting
+Too many open files.
+
+For Linux:
+1. `$ sudo vi /etc/security/limits.conf`
+2. Add
+```bash
+*         hard    nofile      1000000
+*         soft    nofile      1000000
+```
+3. Save and login again. `$ ulimit -a`
+
+For Mac:
+1. `$ sudo su — root`
+2. Create `/Library/LaunchDaemons/limit.maxfiles.plist` with this content:
+```bash
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+          "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>limit.maxfiles</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>launchctl</string>
+      <string>limit</string>
+      <string>maxfiles</string>
+      <string>1000000</string>
+      <string>1000000</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ServiceIPC</key>
+    <false/>
+  </dict>
+</plist>
+```
+3. Restart and `$ ulimit -a`
+
 ## License
 
 MIT

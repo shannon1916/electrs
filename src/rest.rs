@@ -472,7 +472,7 @@ fn prepare_txs(
         .collect()
 }
 
-type BoxFut = Box<Future<Item = Response<Body>, Error = hyper::Error> + Send>;
+type BoxFut = Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send>;
 
 pub fn run_server(config: Arc<Config>, query: Arc<Query>) -> Handle {
     let addr = &config.http_addr;
@@ -673,6 +673,35 @@ fn handle_request(
                 TTL_SHORT,
             )
         }
+
+        (
+            &Method::GET,
+            Some(script_type @ &"address"),
+            Some(script_str),
+            Some(&"height"),
+            Some(stop_height),
+            None
+        )
+        | (
+            &Method::GET,
+            Some(script_type @ &"scripthash"),
+            Some(script_str),
+            Some(&"height"),
+            Some(stop_height),
+            None
+        ) => {
+            let script_hash = to_scripthash(script_type, script_str, &config.network_type)?;
+            let stop_height = stop_height.parse::<usize>()?;
+            let stats = query.chain().stats_to(&script_hash[..], stop_height);
+            json_response(
+                json!({
+                    *script_type: script_str,
+                    "chain_stats": stats,
+                }),
+                TTL_SHORT,
+            )
+        }
+
         (
             &Method::GET,
             Some(script_type @ &"address"),

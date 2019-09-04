@@ -15,7 +15,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-use crate::chain::{BlockHeader, OutPoint, Transaction, TxOut, Value};
+use crate::chain::{/*BlockHeader, */OutPoint, Transaction, TxOut, Value};
 use crate::daemon::Daemon;
 use crate::errors::*;
 use crate::metrics::{HistogramOpts, HistogramTimer, HistogramVec, Metrics};
@@ -587,6 +587,117 @@ impl ChainQuery {
         (stats, lastblock)
     }
 
+    pub fn stats_to(
+        &self,
+        scripthash: &[u8],
+        stop_height: usize) -> ScriptStats {
+        let _timer = self.start_timer("stats_to");
+
+        // get the last known stats and the blockhash they are updated for.
+        // invalidates the cache if the block was orphaned or the height is higher than stop_height
+        let cache: Option<(ScriptStats, usize)> = self
+            .store
+            .cache_db
+            .get(&StatsHeightCacheRow::key(scripthash))
+            .map(|c| bincode::deserialize(&c).unwrap())
+            .and_then(|(stats, blockhash)| {
+                self.height_by_hash(&blockhash)
+                    .filter(|&height| height <= stop_height)
+                    .map(|height| (stats, height))
+            });
+
+        // update stats with new transactions since
+        let (newstats, lastblock) = cache.map_or_else(
+            || self.stats_delta_to(scripthash, ScriptStats::default(), 0, stop_height),
+            |(oldstats, blockheight)| {
+                if blockheight == stop_height {
+                    (oldstats, None)
+                } else {
+                    self.stats_delta_to(scripthash, oldstats, blockheight + 1, stop_height)
+                }
+            }
+        );
+
+        // save updated stats to cache
+        if let Some(lastblock) = lastblock {
+            if newstats.funded_txo_count + newstats.spent_txo_count > MIN_HISTORY_ITEMS_TO_CACHE {
+                self.store.cache_db.write(
+                    vec![StatsHeightCacheRow::new(scripthash, &newstats, &lastblock).to_row()],
+                    DBFlush::Enable,
+                );
+            }
+        }
+
+        newstats
+    }
+
+    fn stats_delta_to(
+        &self,
+        scripthash: &[u8],
+        init_stats: ScriptStats,
+        start_height: usize,
+        stop_height: usize,
+    ) -> (ScriptStats, Option<Sha256dHash>) {
+        let _timer = self.start_timer("stats_delta"); // TODO: measure also the number of txns processed.
+        let stop_height = stop_height as u32;
+        let history_iter = self
+            .history_iter_scan(b'H', scripthash, start_height)
+            .map(TxHistoryRow::from_row)
+            .filter_map(|history| {
+                self.tx_confirming_block(&history.get_txid())
+                    .map(|blockid| (history, blockid))
+            });
+
+        let mut stats = init_stats;
+        let mut seen_txids = HashSet::new();
+        let mut lastblock = None;
+
+        for (history, blockid) in history_iter {
+            if history.key.confirmed_height > stop_height {
+                break;
+            }
+
+            if lastblock != Some(blockid.hash) {
+                seen_txids.clear();
+            }
+
+            if seen_txids.insert(history.get_txid()) {
+                stats.tx_count += 1;
+            }
+
+            match history.key.txinfo {
+                #[cfg(not(feature = "liquid"))]
+                TxHistoryInfo::Funding(ref info) => {
+                    stats.funded_txo_count += 1;
+                    stats.funded_txo_sum += info.value;
+                }
+
+                #[cfg(not(feature = "liquid"))]
+                TxHistoryInfo::Spending(ref info) => {
+                    stats.spent_txo_count += 1;
+                    stats.spent_txo_sum += info.value;
+                }
+
+                #[cfg(feature = "liquid")]
+                TxHistoryInfo::Funding(_) => {
+                    stats.funded_txo_count += 1;
+                }
+
+                #[cfg(feature = "liquid")]
+                TxHistoryInfo::Spending(_) => {
+                    stats.spent_txo_count += 1;
+                }
+
+                #[cfg(feature = "liquid")]
+                TxHistoryInfo::Issuing(_) | TxHistoryInfo::Burning(_) => unreachable!(),
+            }
+
+            lastblock = Some(blockid.hash);
+        }
+
+        (stats, lastblock)
+    }
+
     fn header_by_hash(&self, hash: &Sha256dHash) -> Option<HeaderEntry> {
         self.store
             .indexed_headers
@@ -771,6 +882,7 @@ fn load_blockhashes(db: &DB, prefix: &[u8]) -> HashSet<Sha256dHash> {
         .collect()
 }
 
+/*
 fn load_blockheaders(db: &DB) -> HashMap<Sha256dHash, BlockHeader> {
     db.iter_scan(&BlockRow::header_filter())
         .map(BlockRow::from_row)
@@ -781,6 +893,7 @@ fn load_blockheaders(db: &DB) -> HashMap<Sha256dHash, BlockHeader> {
         })
         .collect()
 }
+*/
 
 fn add_blocks(block_entries: &[BlockEntry]) -> Vec<DBRow> {
     // persist individual transactions:
@@ -1120,9 +1233,11 @@ impl BlockRow {
         }
     }
 
+    /*
     fn header_filter() -> Bytes {
         b"B".to_vec()
     }
+    */
 
     fn txids_key(hash: FullHash) -> Bytes {
         [b"X", &hash[..]].concat()
@@ -1344,6 +1459,34 @@ impl StatsCacheRow {
 
     pub fn key(scripthash: &[u8]) -> Bytes {
         [b"A", scripthash].concat()
+    }
+
+    fn to_row(self) -> DBRow {
+        DBRow {
+            key: bincode::serialize(&self.key).unwrap(),
+            value: self.value,
+        }
+    }
+}
+
+struct StatsHeightCacheRow {
+    key: ScriptCacheKey,
+    value: Bytes,
+}
+
+impl StatsHeightCacheRow {
+    fn new(scripthash: &[u8], stats: &ScriptStats, blockhash: &Sha256dHash) -> Self {
+        StatsHeightCacheRow {
+            key: ScriptCacheKey {
+                code: b'H',
+                scripthash: full_hash(scripthash),
+            },
+            value: bincode::serialize(&(stats, blockhash)).unwrap(),
+        }
+    }
+
+    pub fn key(scripthash: &[u8]) -> Bytes {
+        [b"H", scripthash].concat()
     }
 
     fn to_row(self) -> DBRow {
